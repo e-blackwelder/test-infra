@@ -921,7 +921,7 @@ func handleRequestJobViews(sg *spyglass.Spyglass, cfg config.Getter, o options, 
 		src := strings.TrimPrefix(r.URL.Path, "/view/")
 
 		csrfToken := csrf.Token(r)
-		page, err := renderSpyglass(r.Context(), sg, cfg, src, o, csrfToken, log)
+		page, err := renderSpyglass(r.Context(), sg, w, cfg, src, o, csrfToken, log)
 		if err != nil {
 			log.WithError(err).Error("error rendering spyglass page")
 			message := fmt.Sprintf("error rendering spyglass page: %v", err)
@@ -940,7 +940,7 @@ func handleRequestJobViews(sg *spyglass.Spyglass, cfg config.Getter, o options, 
 }
 
 // renderSpyglass returns a pre-rendered Spyglass page from the given source string
-func renderSpyglass(ctx context.Context, sg *spyglass.Spyglass, cfg config.Getter, src string, o options, csrfToken string, log *logrus.Entry) (string, error) {
+func renderSpyglass(ctx context.Context, sg *spyglass.Spyglass, w http.ResponseWriter, cfg config.Getter, src string, o options, csrfToken string, log *logrus.Entry) (string, error) {
 	renderStart := time.Now()
 
 	src = strings.TrimSuffix(src, "/")
@@ -949,8 +949,8 @@ func renderSpyglass(ctx context.Context, sg *spyglass.Spyglass, cfg config.Gette
 		return "", fmt.Errorf("error when resolving real path %s: %v", src, err)
 	}
 	src = realPath
-	if err := ValidatePath(cfg, src); err != nil {
-		return "", err
+	if err := ValidateStoragePath(cfg, src); err != nil {
+		return "", err // TODO(eblackwelder@): indicate it's http.StatusBadRequest (from inside ValidateStoragePath)
 	}
 	artifactNames, err := sg.ListArtifacts(ctx, src)
 	if err != nil {
@@ -1167,7 +1167,7 @@ func handleArtifactView(o options, sg *spyglass.Spyglass, cfg config.Getter) htt
 			http.Error(w, fmt.Sprintf("Failed to parse request: %v", err), http.StatusBadRequest)
 			return
 		}
-		if err := ValidatePath(cfg, request.Source); err != nil {
+		if err := ValidateStoragePath(cfg, request.Source); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to process request: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -1615,9 +1615,13 @@ func defaultLensRemoteConfig(lfc *config.LensFileConfig) error {
 	return nil
 }
 
-// ValidatePath validates various parts (e.g. bucket, folder, etc.) of a storage path.
-func ValidatePath(cfg config.Getter, path string) error {
-	if !cfg().Deck.EnableWhitelist {
+// ValidateStoragePath validates the storage bucket/folder path, if the `Deck.RestrictStoragePaths` config field is true.
+// The path should match "<key-type>/<bucket>/<folder>/<sub-folder...>" pattern.
+// Additionally, the path bucket or folder should match either the built-in and default storage locations _or_
+// should be contained in the `Deck.AdditionalAllowedBuckets/Folders` config fields.
+// If the `Deck.RestrictStoragePaths` field is false, no validation is performed (and no errors are returned).
+func ValidateStoragePath(cfg config.Getter, path string) error {
+	if !cfg().Deck.RestrictStoragePaths {
 		return nil
 	}
 
@@ -1628,25 +1632,20 @@ func ValidatePath(cfg config.Getter, path string) error {
 
 	// Check bucket
 	bucket := parts[1]
-	bwl := sets.String{}
+	allowed_buckets := sets.NewString(cfg().Deck.AdditionalAllowedBuckets...)
 	for _, dc := range cfg().Plank.DefaultDecorationConfigs {
-		bwl.Insert(dc.GCSConfiguration.Bucket)
+		allowed_buckets.Insert(dc.GCSConfiguration.Bucket)
 	}
-	for _, bucket := range cfg().Deck.AdditionalBuckets {
-		bwl.Insert(bucket)
-	}
-	if !bwl.Has(bucket) {
-		return fmt.Errorf("bucket %q not in whitelist %v", bucket, bwl)
+	if !allowed_buckets.Has(bucket) {
+		return fmt.Errorf("bucket %q not in allowed list %v", bucket, allowed_buckets)
 	}
 
 	// Check folder
 	folder := parts[2]
-	fwl := sets.NewString(gcs.PRLogs, gcs.NonPRLogs)
-	for _, folder := range cfg().Deck.AdditionalFolders {
-		fwl.Insert(folder)
-	}
-	if !fwl.Has(folder) {
-		return fmt.Errorf("folder %q not in whitelist %v", folder, fwl)
+	allowed_folders := sets.NewString(gcs.PRLogs, gcs.NonPRLogs)
+	allowed_folders.Insert(cfg().Deck.AdditionalAllowedFolders...)
+	if !allowed_folders.Has(folder) {
+		return fmt.Errorf("folder %q not in allowed list %v", folder, allowed_folders)
 	}
 
 	return nil
